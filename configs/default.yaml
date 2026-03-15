@@ -1,0 +1,97 @@
+seed: 42
+
+# -----------------------------------------------------------------------------
+# 数据
+# -----------------------------------------------------------------------------
+data:
+  datasets_root: /home/liushudong/AAASSET/datasets/imagen/
+  dataset_name: celeba
+  img_size: 64
+  batch_size: 64
+  num_workers: 4
+  pin_memory: true
+  train_augment: true
+  normalize_mean: 0.5
+  normalize_std: 0.5
+  cache_paths: false
+
+# -----------------------------------------------------------------------------
+# 训练：步数、buffer、rollout
+# -----------------------------------------------------------------------------
+train:
+  use_vq: false
+
+  max_steps: 1000000
+  log_interval: 1
+  val_interval: 100
+
+  buffer_size: 20000
+  batch_rl: 64
+  batch_d: 64
+
+  warmup_steps: 10
+  d_steps: 1
+  d_batch: 64
+  renderer_freeze_steps: 0
+
+  horizon: 128
+  stop_tau: 0.9999
+
+# -----------------------------------------------------------------------------
+# 训练：RL 与奖励
+# -----------------------------------------------------------------------------
+  gamma: 0.99
+  shaping_scale: 1e2
+
+  adv_reward_lambda: 1.0
+  l2_reward_lambda: 1
+  lpips_lambda: 1
+  msssim_lambda: 0.0
+
+  entropy_alpha: 1e-5
+  tau: 0.005
+
+# -----------------------------------------------------------------------------
+# 训练：学习率与日志
+# -----------------------------------------------------------------------------
+  actor_lr: 1e-4
+  renderer_lr: 1e-4
+  critic_lr: 3e-4
+  d_lr: 3e-5
+  codebook_lr: 3e-5
+  weight_decay: 0.05
+
+  save_interval: 10000
+  dump_every_n_batches: 8
+
+# -----------------------------------------------------------------------------
+# 模型：全局与 VQ
+# -----------------------------------------------------------------------------
+model:
+  img_size: 64
+  patch_size: 8
+  seq_len: 64
+  canvas_channels: 3
+  token_dim: 64
+  hidden_dim: 512
+
+  codebook_size: 8192
+  use_vq: false
+
+# -----------------------------------------------------------------------------
+# 模型：Actor / Renderer / Critic / GAN
+# -----------------------------------------------------------------------------
+  actor_depth: 12
+  actor_attn_heads: 16
+  actor_std_head: true
+  actor_log_std_min: -5.0
+  actor_log_std_max: 2.0
+
+  renderer_depth: 8
+  renderer_attn_heads: 16
+
+  critic_depth: 12
+  critic_attn_heads: 16
+
+  use_gp: true
+  gp_lambda: 10.0
