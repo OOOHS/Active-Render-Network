@@ -12,7 +12,7 @@ from modules.vq import VectorQuantizer, IdentityVQ
 from modules.renderer import Renderer
 from modules.reward_discriminator import Discriminator, wgan_gp_loss
 from modules import target_nets
-from rl.utils import OUNoise
+from rl.utils import OUNoise, LinearSchedule
 from rl.buffer import ReplayBuffer
 from utils.metrics import mse_similarity
 
@@ -52,7 +52,19 @@ class PainterSystem(pl.LightningModule):
 
         # ---- buffer & utils ----
         self.buf = ReplayBuffer(int(self.cfg.train.buffer_size))
-        self.ou = OUNoise(action_dim=self.cfg.model.token_dim)
+        self.ou = OUNoise(
+            action_dim=self.cfg.model.token_dim,
+            theta=float(getattr(self.cfg.train, "ou_theta", 0.15)),
+            sigma=float(getattr(self.cfg.train, "ou_sigma", 0.2)),
+        )
+        # 衰减的 OU 探索：前期有探索，后期趋于纯确定性（DDPG）
+        explore_steps = int(getattr(self.cfg.train, "explore_steps", 100000))
+        ou_scale_end = float(getattr(self.cfg.train, "ou_scale_end", 0.0))
+        self.ou_scale_schedule = LinearSchedule(
+            start=float(getattr(self.cfg.train, "ou_scale_init", 0.3)),
+            end=ou_scale_end,
+            duration=explore_steps,
+        )
         
         self.automatic_optimization = False
         self.sim_fn = mse_similarity
@@ -229,10 +241,11 @@ class PainterSystem(pl.LightningModule):
             bonus_l2[mask_idx] = (-mse_nxt[mask_idx]) * shaping_scale
 
             # --- B. GAN Score ---
+            # Clip WGAN scores to prevent unbounded Q-value targets.
             _set_requires_grad(self.D_t, False)
             gan_score = self.D_t(self._cond_pair(C_next[mask_idx], I[mask_idx]))
             _set_requires_grad(self.D_t, True)
-            bonus_gan[mask_idx] = gan_score.view(-1).to(dtype=bonus_gan.dtype)
+            bonus_gan[mask_idx] = gan_score.view(-1).clamp(-10.0, 10.0).to(dtype=bonus_gan.dtype)
 
             # --- C. LPIPS Absolute Score ---
             if self.use_lpips:
@@ -297,8 +310,9 @@ class PainterSystem(pl.LightningModule):
             if self.global_step < warmup:
                 a = torch.randn(B, M.token_dim, device=self.device).tanh()
             else:
-                a_sample, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
-                a = a_sample.detach()
+                a_det = self.actor.act_deterministic(I_star, C_live, t_emb=t_emb)
+                ou_scale = self.ou_scale_schedule(self.global_step)
+                a = (a_det + ou_scale * self.ou.sample_like(a_det)).clamp(-1.0, 1.0)
 
             _, z, _, _, _ = self.vq(a)
             C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
@@ -315,6 +329,9 @@ class PainterSystem(pl.LightningModule):
 
             if done_bool.all():
                 break
+
+        # Reset OU state at end of each episode to prevent cross-episode noise drift.
+        self.ou.reset()
 
         if do_dump and len(debug_frames) > 0:
             debug_frames.append(I_star[0].detach().cpu())
@@ -389,7 +406,7 @@ class PainterSystem(pl.LightningModule):
         self.log("train/sim", r_info["sim_score"].mean(), prog_bar=True)
 
     def _step_actor(self) -> None:
-        """从 buffer 采样，Actor 前向得 C_next_hat，算 reward 与 SAC loss，更新 Actor/Renderer 并软更新 target。"""
+        """DDPG：从 buffer 采样，确定性 Actor 得 C_next_hat，最大化 reward + gamma*Q，更新 Actor/Renderer 并软更新 target。"""
         T = self.cfg.train
         M = self.cfg.model
         opt_arc, opt_critics, opt_D = self.optimizers()
@@ -406,7 +423,7 @@ class PainterSystem(pl.LightningModule):
         freeze_renderer = self.global_step < int(getattr(T, "renderer_freeze_steps", 0))
         _set_requires_grad(self.renderer, not freeze_renderer)
 
-        a_hat, logp_hat, _, _ = self.actor.sample(I_s, C_s, t_emb=t_s)
+        a_hat = self.actor(I_s, C_s, t_emb=t_s)
         _, z_hat, commit_loss, codebook_loss, _ = self.vq(a_hat)
         C_next_hat = self.renderer(C_s, z_hat, t_emb=t_s).clamp(-1, 1)
         r_b_total, r_info_b = self._compute_reward(I_s, C_s, C_next_hat, is_terminal)
@@ -417,8 +434,7 @@ class PainterSystem(pl.LightningModule):
         v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s)
         min_v_next = torch.minimum(v1_next, v2_next)
         q_val = (1.0 - done_s.squeeze(1)) * min_v_next
-        entropy_alpha = float(T.entropy_alpha)
-        actor_obj = r_b_total + gamma * q_val - entropy_alpha * logp_hat
+        actor_obj = r_b_total + gamma * q_val
         loss_actor = -actor_obj.mean() + commit_loss + codebook_loss
 
         self.manual_backward(loss_actor)

@@ -25,38 +25,49 @@ train:
   log_interval: 1
   val_interval: 100
 
-  buffer_size: 20000
+  buffer_size: 50000
   batch_rl: 64
   batch_d: 64
 
-  warmup_steps: 10
-  d_steps: 1
+  warmup_steps: 500
+  d_steps: 3
   d_batch: 64
   renderer_freeze_steps: 0
 
-  horizon: 128
-  stop_tau: 0.9999
+  # horizon=64 对齐 num_patches (64×64 img / 8×8 patch = 64)，
+  # 每步 action 约对应一个空间 token，支撑从粗到细的变长编码
+  horizon: 64
+  # 高保真目标；即使难以触发 done=1，buffer 的 t>0.95 条件
+  # 依然会把最后几步写入 terminal buffer 供 discriminator 使用
+  stop_tau: 0.999
 
 # -----------------------------------------------------------------------------
 # 训练：RL 与奖励
 # -----------------------------------------------------------------------------
   gamma: 0.99
-  shaping_scale: 1e2
+  # 每步 MSE 增量约 0.01-0.03，乘以 50 得 shaping reward ≈ 0.5-1.5，
+  # 累积 Q ≈ 60-80，量级合理且信号够强
+  shaping_scale: 50.0
 
   adv_reward_lambda: 1.0
-  l2_reward_lambda: 1
-  lpips_lambda: 1
+  l2_reward_lambda: 1.0
+  lpips_lambda: 0.5
   msssim_lambda: 0.0
 
-  entropy_alpha: 1e-5
   tau: 0.005
+
+  explore_steps: 50000
+  ou_scale_init: 0.5
+  ou_scale_end: 0.0
+  ou_theta: 0.15
+  ou_sigma: 0.2
 
 # -----------------------------------------------------------------------------
 # 训练：学习率与日志
 # -----------------------------------------------------------------------------
-  actor_lr: 1e-4
-  renderer_lr: 1e-4
-  critic_lr: 3e-4
+  actor_lr: 3e-5
+  renderer_lr: 3e-5
+  critic_lr: 1e-4
   d_lr: 3e-5
   codebook_lr: 3e-5
   weight_decay: 0.05
@@ -83,9 +94,6 @@ model:
 # -----------------------------------------------------------------------------
   actor_depth: 12
   actor_attn_heads: 16
-  actor_std_head: true
-  actor_log_std_min: -5.0
-  actor_log_std_max: 2.0
 
   renderer_depth: 8
   renderer_attn_heads: 16

@@ -163,7 +163,7 @@ class Renderer(nn.Module):
         output_tokens = x[:, 1:, :] 
         pred_patches = self.head(output_tokens)
         
-        # 6. Reconstruct
-        x_next = self.unpatchify(pred_patches)
-        
-        return x_next
+        # 6. Reconstruct as residual: C_next = C + delta
+        # With zero-init head this means "no change" at init, which is the correct prior.
+        delta = self.unpatchify(pred_patches)
+        return C + delta

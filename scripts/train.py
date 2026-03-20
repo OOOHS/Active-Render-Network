@@ -10,7 +10,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint
 
 from swanlab.integration.pytorch_lightning import SwanLabLogger
 
-os.environ["SWANLAB_MODE"] = "offline"
+# os.environ["SWANLAB_MODE"] = "offline"
 
 def main():
     # 1) 统一从 load_config() 加载完整 cfg
@@ -35,7 +35,7 @@ def main():
     )
 
     # 5) Trainer
-    swan_logger = SwanLabLogger(project="ARN", name="0k-vit-shaping_fix-sacling-adamw", config=cfg,)
+    swan_logger = SwanLabLogger(project="ARN", name="0k-DDPG", config=cfg,)
     trainer = pl.Trainer(
         max_steps=cfg.train.max_steps,
         log_every_n_steps=cfg.train.log_interval,
