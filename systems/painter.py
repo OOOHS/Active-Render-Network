@@ -12,7 +12,6 @@ from modules.vq import VectorQuantizer, IdentityVQ
 from modules.renderer import Renderer
 from modules.reward_discriminator import Discriminator, wgan_gp_loss
 from modules import target_nets
-from rl.utils import OUNoise, LinearSchedule
 from rl.buffer import ReplayBuffer
 from utils.metrics import mse_similarity
 
@@ -52,20 +51,7 @@ class PainterSystem(pl.LightningModule):
 
         # ---- buffer & utils ----
         self.buf = ReplayBuffer(int(self.cfg.train.buffer_size))
-        self.ou = OUNoise(
-            action_dim=self.cfg.model.token_dim,
-            theta=float(getattr(self.cfg.train, "ou_theta", 0.15)),
-            sigma=float(getattr(self.cfg.train, "ou_sigma", 0.2)),
-        )
-        # 衰减的 OU 探索：前期有探索，后期趋于纯确定性（DDPG）
-        explore_steps = int(getattr(self.cfg.train, "explore_steps", 100000))
-        ou_scale_end = float(getattr(self.cfg.train, "ou_scale_end", 0.0))
-        self.ou_scale_schedule = LinearSchedule(
-            start=float(getattr(self.cfg.train, "ou_scale_init", 0.3)),
-            end=ou_scale_end,
-            duration=explore_steps,
-        )
-        
+
         self.automatic_optimization = False
         self.sim_fn = mse_similarity
 
@@ -87,6 +73,10 @@ class PainterSystem(pl.LightningModule):
 
         self.use_msssim = float(getattr(self.cfg.train, "msssim_lambda", 0.0)) > 0.0
 
+        # 熵退火：相似度长期「卡在」plateau_sim 附近后才开始把 α 线性降到 entropy_alpha_end
+        self.register_buffer("_entropy_anneal_start_step", torch.tensor(-1, dtype=torch.long))
+        self.register_buffer("_entropy_plateau_streak", torch.tensor(0, dtype=torch.long))
+
     # ---------------- helpers ----------------
     def _soft_update(self):
         tau = float(self.cfg.train.tau)
@@ -94,6 +84,79 @@ class PainterSystem(pl.LightningModule):
         target_nets.soft_update(self.critic1_t, self.critic1, tau)
         target_nets.soft_update(self.critic2_t, self.critic2, tau)
         target_nets.soft_update(self.D_t, self.D, tau)
+
+    def _current_entropy_alpha(self) -> float:
+        """SAC 熵系数；未触发退火前为 entropy_alpha，触发后线性退火至 entropy_alpha_end。"""
+        T = self.cfg.train
+        a0 = float(getattr(T, "entropy_alpha", 1e-5))
+        a1 = float(getattr(T, "entropy_alpha_end", 0.0))
+        duration = max(int(getattr(T, "entropy_anneal_duration", 50_000)), 1)
+        start = int(self._entropy_anneal_start_step.item())
+        if start < 0:
+            return a0
+        gs = int(self.global_step)
+        if gs <= start:
+            return a0
+        t = min(1.0, float(gs - start) / float(duration))
+        return (1.0 - t) * a0 + t * a1
+
+    def _update_entropy_anneal_after_rollout(self, rollout_sim_mean: float) -> None:
+        """rollout 结束画布相对目标的 batch 平均相似度；在 warmup 之后统计「卡在 plateau」以触发退火。"""
+        T = self.cfg.train
+        if self.global_step < int(T.warmup_steps):
+            return
+        if int(self._entropy_anneal_start_step.item()) >= 0:
+            return
+
+        center = float(getattr(T, "entropy_plateau_sim", 0.95))
+        band = float(getattr(T, "entropy_plateau_band", 0.02))
+        patience = int(getattr(T, "entropy_plateau_patience", 500))
+        low, high = center - band, center + band
+
+        if low <= rollout_sim_mean <= high:
+            self._entropy_plateau_streak.add_(1)
+        else:
+            self._entropy_plateau_streak.zero_()
+
+        if int(self._entropy_plateau_streak.item()) >= patience:
+            self._entropy_anneal_start_step.fill_(int(self.global_step))
+
+    def _renderer_consistency_loss(
+        self,
+        C_in: torch.Tensor,
+        z_in: torch.Tensor,
+        t_in: torch.Tensor,
+        C_out: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        对比式一致性约束：
+        - 输入相近 -> 输出相近
+        - 输入相远 -> 输出相远
+        通过匹配 batch 内输入/输出的两两距离矩阵实现。
+        """
+        if C_out.size(0) < 2:
+            return C_out.new_zeros(())
+
+        T = self.cfg.train
+        pool = int(getattr(T, "renderer_consistency_pool", 4))
+
+        c_feat = F.adaptive_avg_pool2d(C_in.detach(), output_size=(pool, pool)).flatten(1)
+        z_feat = z_in.detach()
+        t_feat = t_in.detach().view(t_in.size(0), -1)
+        in_feat = torch.cat([c_feat, z_feat, t_feat], dim=1)
+        out_feat = F.adaptive_avg_pool2d(C_out, output_size=(pool, pool)).flatten(1)
+
+        in_feat = F.normalize(in_feat, dim=1, eps=1e-6)
+        out_feat = F.normalize(out_feat, dim=1, eps=1e-6)
+
+        d_in = (1.0 - (in_feat @ in_feat.transpose(0, 1))).clamp_min(0.0)
+        d_out = (1.0 - (out_feat @ out_feat.transpose(0, 1))).clamp_min(0.0)
+
+        mask = ~torch.eye(d_in.size(0), dtype=torch.bool, device=d_in.device)
+        if not mask.any():
+            return C_out.new_zeros(())
+
+        return F.smooth_l1_loss(d_out[mask], d_in[mask].detach())
 
     def _init_canvas(self, I_star: torch.Tensor) -> torch.Tensor:
         return torch.zeros_like(I_star) 
@@ -310,9 +373,8 @@ class PainterSystem(pl.LightningModule):
             if self.global_step < warmup:
                 a = torch.randn(B, M.token_dim, device=self.device).tanh()
             else:
-                a_det = self.actor.act_deterministic(I_star, C_live, t_emb=t_emb)
-                ou_scale = self.ou_scale_schedule(self.global_step)
-                a = (a_det + ou_scale * self.ou.sample_like(a_det)).clamp(-1.0, 1.0)
+                a_sample, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
+                a = a_sample.detach()
 
             _, z, _, _, _ = self.vq(a)
             C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
@@ -330,8 +392,9 @@ class PainterSystem(pl.LightningModule):
             if done_bool.all():
                 break
 
-        # Reset OU state at end of each episode to prevent cross-episode noise drift.
-        self.ou.reset()
+        with torch.no_grad():
+            rollout_sim_mean = float(self.sim_fn(C_live, I_star).mean().item())
+        self._update_entropy_anneal_after_rollout(rollout_sim_mean)
 
         if do_dump and len(debug_frames) > 0:
             debug_frames.append(I_star[0].detach().cpu())
@@ -406,7 +469,7 @@ class PainterSystem(pl.LightningModule):
         self.log("train/sim", r_info["sim_score"].mean(), prog_bar=True)
 
     def _step_actor(self) -> None:
-        """DDPG：从 buffer 采样，确定性 Actor 得 C_next_hat，最大化 reward + gamma*Q，更新 Actor/Renderer 并软更新 target。"""
+        """SAC：从 buffer 采样，重参数动作与 log π，最大化 r + γQ - α log π，更新 Actor/Renderer 并软更新 target。"""
         T = self.cfg.train
         M = self.cfg.model
         opt_arc, opt_critics, opt_D = self.optimizers()
@@ -423,7 +486,7 @@ class PainterSystem(pl.LightningModule):
         freeze_renderer = self.global_step < int(getattr(T, "renderer_freeze_steps", 0))
         _set_requires_grad(self.renderer, not freeze_renderer)
 
-        a_hat = self.actor(I_s, C_s, t_emb=t_s)
+        a_hat, logp_hat, _, _ = self.actor.sample(I_s, C_s, t_emb=t_s)
         _, z_hat, commit_loss, codebook_loss, _ = self.vq(a_hat)
         C_next_hat = self.renderer(C_s, z_hat, t_emb=t_s).clamp(-1, 1)
         r_b_total, r_info_b = self._compute_reward(I_s, C_s, C_next_hat, is_terminal)
@@ -434,8 +497,19 @@ class PainterSystem(pl.LightningModule):
         v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s)
         min_v_next = torch.minimum(v1_next, v2_next)
         q_val = (1.0 - done_s.squeeze(1)) * min_v_next
-        actor_obj = r_b_total + gamma * q_val
-        loss_actor = -actor_obj.mean() + commit_loss + codebook_loss
+        entropy_alpha = self._current_entropy_alpha()
+        actor_obj = r_b_total + gamma * q_val - entropy_alpha * logp_hat
+        renderer_consistency_lambda = float(getattr(T, "renderer_consistency_lambda", 0.05))
+        if renderer_consistency_lambda > 0.0:
+            loss_consistency = self._renderer_consistency_loss(C_s, z_hat, t_s, C_next_hat)
+        else:
+            loss_consistency = C_next_hat.new_zeros(())
+        loss_actor = (
+            -actor_obj.mean()
+            + commit_loss
+            + codebook_loss
+            + renderer_consistency_lambda * loss_consistency
+        )
 
         self.manual_backward(loss_actor)
         self.clip_gradients(opt_arc, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
@@ -444,6 +518,8 @@ class PainterSystem(pl.LightningModule):
         self._soft_update()
 
         self.log("loss/actor", loss_actor.detach(), prog_bar=True)
+        self.log("train/entropy_alpha", entropy_alpha, prog_bar=False)
+        self.log("loss/renderer_consistency", loss_consistency.detach(), prog_bar=False)
         mask_idx = r_info_b["mask_idx"]
         if mask_idx.any():
             self.log("rew/term_gan_val", r_info_b["r_term_gan"][mask_idx].mean(), prog_bar=False)

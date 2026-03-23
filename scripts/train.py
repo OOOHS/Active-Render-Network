@@ -35,7 +35,7 @@ def main():
     )
 
     # 5) Trainer
-    swan_logger = SwanLabLogger(project="ARN", name="0k-DDPG", config=cfg,)
+    swan_logger = SwanLabLogger(project="ARN", name="0k-SAC", config=cfg,)
     trainer = pl.Trainer(
         max_steps=cfg.train.max_steps,
         log_every_n_steps=cfg.train.log_interval,

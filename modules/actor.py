@@ -131,8 +131,17 @@ class Actor(nn.Module):
         ])
         self.final_norm = AdaLN(self.embed_dim, cond_dim)
 
-        # ==================== Head (DDPG 确定性策略：仅输出 mu，无方差头) ====================
+        # ==================== Heads (SAC：μ + log σ) ====================
         self.mu_head = nn.Linear(self.embed_dim, self.token_dim)
+
+        self.log_std_min = float(getattr(cfg_model, "actor_log_std_min", -5.0))
+        self.log_std_max = float(getattr(cfg_model, "actor_log_std_max", 2.0))
+        self.use_std_head = bool(getattr(cfg_model, "actor_std_head", True))
+
+        if self.use_std_head:
+            self.logstd_head = nn.Linear(self.embed_dim, self.token_dim)
+        else:
+            self.log_std = nn.Parameter(torch.full((self.token_dim,), -0.5))
 
     def _patchify(self, img):
         # [B, 3, 64, 64] -> [B, 768, 8, 8] -> [B, 64, 768]
@@ -163,17 +172,38 @@ class Actor(nn.Module):
         x = self.final_norm(x, t_cond)
         return x[:, 0, :] # 返回 Query Token
 
-    def _get_action(self, I_star, C, t_emb=None):
-        """确定性动作：backbone -> mu -> tanh，无方差输出（DDPG 风格）。"""
+    def _get_mu_logstd(self, I_star, C, t_emb=None):
         if t_emb is None:
             t_emb = torch.zeros(I_star.shape[0], 1, device=I_star.device)
         h = self._forward_backbone(I_star, C, t_emb)
         mu = self.mu_head(h)
-        return torch.tanh(mu)
+        if self.use_std_head:
+            log_std = self.logstd_head(h)
+        else:
+            log_std = self.log_std.unsqueeze(0).expand_as(mu)
+        log_std = torch.clamp(log_std, self.log_std_min, self.log_std_max)
+        return mu, log_std
 
     @torch.no_grad()
     def act_deterministic(self, I_star, C, t_emb=None):
-        return self._get_action(I_star, C, t_emb)
+        mu, _ = self._get_mu_logstd(I_star, C, t_emb)
+        return torch.tanh(mu)
 
     def forward(self, I_star, C, t_emb=None):
-        return self._get_action(I_star, C, t_emb)
+        mu, _ = self._get_mu_logstd(I_star, C, t_emb)
+        return torch.tanh(mu)
+
+    def sample(self, I_star, C, t_emb=None):
+        eps = 1e-6
+        mu, log_std = self._get_mu_logstd(I_star, C, t_emb)
+        std = torch.exp(log_std)
+        noise = torch.randn_like(mu)
+        u = mu + std * noise
+        a = torch.tanh(u)
+
+        logp_gauss = -0.5 * (((u - mu) / (std + eps)) ** 2 + 2 * log_std + math.log(2 * math.pi))
+        logp_gauss = logp_gauss.sum(dim=1)
+        logp_correction = torch.log(1 - a.pow(2) + eps).sum(dim=1)
+        logp = logp_gauss - logp_correction
+
+        return a, logp, mu, log_std
