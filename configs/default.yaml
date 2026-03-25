@@ -55,7 +55,7 @@ train:
   # SAC 自动温度调整
   entropy_alpha: 1e-3         # log α 初始值，训练中自动调整
   alpha_lr: 3e-4              # 温度系数 α 的学习率
-  target_entropy_coef: 1.0    # 目标熵 = -token_dim * coef；调小可减少探索
+  target_entropy_coef: 0.1    # 目标熵 = -token_dim * coef；调小可减少探索
   # renderer 对比一致性：输入近则输出近、输入远则输出远（batch 内距离矩阵对齐）；设为 0 关闭
   renderer_consistency_lambda: 0
   renderer_consistency_pool: 4 # 每 4 步算一次 renderer 对比一致性
