@@ -339,7 +339,7 @@ class PainterSystem(pl.LightningModule):
         # ==========================================
         info = {
             "mse_nxt": mse_nxt.detach(),
-            "sim_score": (1.0 - mse_nxt.detach()),
+            "sim_score": (1.0 - mse_nxt.detach()).clamp(0.0, 1.0),
             "r_shaping_l2": r_shaping_l2.detach(), 
             "r_shaping_lpips": r_shaping_lpips.detach(),
             "r_term_gan": torch.zeros_like(r_shaping_l2), 
@@ -366,33 +366,32 @@ class PainterSystem(pl.LightningModule):
         do_dump = (batch_idx % dump_every == 0)
         debug_frames = []
 
-        for t in range(horizon):
-            t_norm = float(t) / max(float(horizon - 1), 1.0)
-            t_emb = torch.full((B, 1), t_norm, device=self.device)
-
-            if self.global_step < warmup:
-                a = torch.randn(B, M.token_dim, device=self.device).tanh()
-            else:
-                a_sample, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
-                a = a_sample.detach()
-
-            _, z, _, _, _ = self.vq(a)
-            C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
-
-            sim_vec = self.sim_fn(C_next, I_star).view(B, -1).mean(dim=1)
-            done_bool = (sim_vec >= stop_tau)
-            done_float = done_bool.float().unsqueeze(1)
-
-            self.buf.add(I_star, C_live, a, C_next, done=done_float, t=t_emb)
-            C_live = C_next.detach()
-
-            if do_dump and (t % 10 == 0):
-                debug_frames.append(C_live[0].detach().cpu())
-
-            if done_bool.all():
-                break
-
         with torch.no_grad():
+            for t in range(horizon):
+                t_norm = float(t) / max(float(horizon - 1), 1.0)
+                t_emb = torch.full((B, 1), t_norm, device=self.device)
+
+                if self.global_step < warmup:
+                    a = torch.randn(B, M.token_dim, device=self.device).tanh()
+                else:
+                    a, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
+
+                _, z, _, _, _ = self.vq(a)
+                C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
+
+                sim_vec = self.sim_fn(C_next, I_star).view(B, -1).mean(dim=1)
+                done_bool = (sim_vec >= stop_tau)
+                done_float = done_bool.float().unsqueeze(1)
+
+                self.buf.add(I_star, C_live, a, C_next, done=done_float, t=t_emb)
+                C_live = C_next.detach()
+
+                if do_dump and (t % 10 == 0):
+                    debug_frames.append(C_live[0].detach().cpu())
+
+                if done_bool.all():
+                    break
+
             rollout_sim_mean = float(self.sim_fn(C_live, I_star).mean().item())
         self._update_entropy_anneal_after_rollout(rollout_sim_mean)
 
@@ -447,12 +446,16 @@ class PainterSystem(pl.LightningModule):
         I_s, C_s, a_s, C_ns, done_s, t_s = self.buf.sample(batch_rl, self.device)
         is_terminal = (done_s > 0.5) | (t_s > 0.95)
 
+        # next-state 的 t_emb 应比当前步多一个步长
+        t_step = 1.0 / max(float(int(T.horizon) - 1), 1.0)
+        t_s_next = (t_s + t_step).clamp(0.0, 1.0)
+
         self.toggle_optimizer(opt_critics)
         opt_critics.zero_grad(set_to_none=True)
         with torch.no_grad():
             r_total, r_info = self._compute_reward(I_s, C_s, C_ns, is_terminal)
-            v1_t = self.critic1_t(I_s, C_ns, t_emb=t_s)
-            v2_t = self.critic2_t(I_s, C_ns, t_emb=t_s)
+            v1_t = self.critic1_t(I_s, C_ns, t_emb=t_s_next)
+            v2_t = self.critic2_t(I_s, C_ns, t_emb=t_s_next)
             min_v = torch.minimum(v1_t, v2_t)
             y = r_total + (1.0 - done_s.squeeze(1)) * gamma * min_v
 
@@ -481,6 +484,10 @@ class PainterSystem(pl.LightningModule):
         I_s, C_s, a_s, _, done_s, t_s = self.buf.sample(batch_rl, self.device)
         is_terminal = (done_s > 0.5) | (t_s > 0.95)
 
+        # next-state 的 t_emb 应比当前步多一个步长
+        t_step = 1.0 / max(float(int(T.horizon) - 1), 1.0)
+        t_s_next = (t_s + t_step).clamp(0.0, 1.0)
+
         self.toggle_optimizer(opt_arc)
         opt_arc.zero_grad(set_to_none=True)
         freeze_renderer = self.global_step < int(getattr(T, "renderer_freeze_steps", 0))
@@ -493,8 +500,8 @@ class PainterSystem(pl.LightningModule):
 
         self.log("train/sim_actor", r_info_b["sim_score"].mean(), prog_bar=False)
 
-        v1_next = self.critic1_t(I_s, C_next_hat, t_emb=t_s)
-        v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s)
+        v1_next = self.critic1_t(I_s, C_next_hat, t_emb=t_s_next)
+        v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s_next)
         min_v_next = torch.minimum(v1_next, v2_next)
         q_val = (1.0 - done_s.squeeze(1)) * min_v_next
         entropy_alpha = self._current_entropy_alpha()

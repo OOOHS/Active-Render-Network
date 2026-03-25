@@ -16,10 +16,11 @@ def rollout(sys, batch, max_steps=1024, stop_tau=0.98, outdir="outputs"):
     C_cur = torch.zeros_like(I_star)
 
     for t in range(max_steps):
-        a = sys.actor(I_star, C_cur)
-        idx, z, _ = sys.vq(a)
-        delta = sys.renderer(C_cur, z)
-        C_next = C_cur + delta
+        t_norm = float(t) / max(float(max_steps - 1), 1.0)
+        t_emb = torch.full((B, 1), t_norm, device=device)
+        a = sys.actor.act_deterministic(I_star, C_cur, t_emb=t_emb)
+        _, z, _, _, _ = sys.vq(a)
+        C_next = sys.renderer(C_cur, z, t_emb=t_emb).clamp(-1, 1)
 
         # 保存当前步的画布（[-1,1] → [0,1]）
         img_to_save = (C_next.clamp(-1, 1) + 1) / 2.0

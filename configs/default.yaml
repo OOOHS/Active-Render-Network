@@ -34,9 +34,7 @@ train:
   d_batch: 64
   renderer_freeze_steps: 0
 
-  # horizon=64 对齐 num_patches (64×64 img / 8×8 patch = 64)，
-  # 每步 action 约对应一个空间 token，支撑从粗到细的变长编码
-  horizon: 128
+  horizon: 128  # 每步 action 约对应一个空间 patch token，支撑从粗到细的变长编码
   # 高保真目标；即使难以触发 done=1，buffer 的 t>0.95 条件
   # 依然会把最后几步写入 terminal buffer 供 discriminator 使用
   stop_tau: 0.999
@@ -54,13 +52,8 @@ train:
   lpips_lambda: 0.5
   msssim_lambda: 0.0
 
-  entropy_alpha: 1e-5
-  # 相似度长期落在 plateau_sim±band（默认 0.95±0.02）后，开始把熵系数线性降到 entropy_alpha_end
-  entropy_alpha_end: 0.0
-  entropy_anneal_duration: 50000
-  entropy_plateau_sim: 0.95
-  entropy_plateau_band: 0.02
-  entropy_plateau_patience: 500
+  entropy_alpha: 1e-3
+  entropy_alpha_end: 1e-3   # 与 entropy_alpha 相同 → 恒定熵系数，不退火
   # renderer 对比一致性：输入近则输出近、输入远则输出远（batch 内距离矩阵对齐）；设为 0 关闭
   renderer_consistency_lambda: 0
   renderer_consistency_pool: 4 # 每 4 步算一次 renderer 对比一致性
