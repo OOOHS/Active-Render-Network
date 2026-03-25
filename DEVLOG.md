@@ -86,3 +86,37 @@
 - 平台期前保持探索能力，平台期后自动降熵细化重建，减轻“早收敛但细节不足”。
 - Renderer 映射更平滑、局部扰动更可控，降低输入微扰导致输出跳变的风险。
 - 在不破坏现有稳定性增强策略的前提下，提升后期收敛质量与可调参性。
+
+## 2026-03-25：P0 修复 + 评估脚本对齐 + SAC 自动温度调整
+
+### 动机
+- 代码审查发现 Critic 对 `V(s')` 使用了当前步 `t_emb`，与 AdaLN 时间条件不一致，bootstrap 偏差。
+- Rollout 在 `no_grad` 外调用 `actor.sample` / `renderer`，128 步会徒增显存占用。
+- `scripts/eval.py` 与训练 API 脱节（VQ 解包、`t_emb`、双重残差）。
+- 固定或平台退火式 `entropy_alpha` 易不稳或难调；改用 SAC 标准「自动温度调整」，目标熵支持默认自动 + 系数缩放。
+
+### 改动摘要
+
+1. **Critic bootstrap 时间对齐（`systems/painter.py`）**
+   - `_step_critic` / `_step_actor` 中评估下一状态时：`t_s_next = (t_s + 1/(horizon-1)).clamp(0, 1)`，对 `C_next` / `C_next_hat` 使用 `t_emb=t_s_next`。
+
+2. **Rollout 显存（`systems/painter.py`）**
+   - 整条 horizon 循环包在 `torch.no_grad()` 内；仅收集数据，不建 Actor/Renderer 大计算图。
+
+3. **评估脚本（`scripts/eval.py`）**
+   - VQ 五元组解包；每步构造 `t_emb`；`act_deterministic(..., t_emb)`；`renderer` 直接得到 `C_next`（内部已为残差），去掉外层再加 `C_cur + delta`。
+
+4. **观测与配置小修**
+   - `_compute_reward` 中 `sim_score` 对 `(1 - mse_nxt)` 做 `[0,1]` clamp，与 `mse_similarity` 一致。
+   - `configs/default.yaml`：`horizon` 注释去掉过期的「必须 64」表述。
+
+5. **SAC 自动温度调整（替换平台熵退火）**
+   - `log_alpha` 为可学习参数，初值来自 `entropy_alpha`（如 `1e-3`）。
+   - 单独优化器 `opt_alpha`，`alpha_lr`（默认 `3e-4`）；`alpha_loss = -(log_alpha * (logp.detach() + target_entropy)).mean()`。
+   - **目标熵**：`target_entropy = -token_dim * target_entropy_coef`（默认 `coef=1.0`，即 SAC 惯例 `-dim`）；调小 `coef`（如 `0.5`）可减弱探索，适合渐进重建。
+   - Actor 侧使用 `alpha.detach() * logp`，避免策略梯度回传到 `log_alpha`。
+   - 移除 `_current_entropy_alpha`、`_update_entropy_anneal_after_rollout` 及 plateau / `entropy_alpha_end` 等配置项。
+
+### 预期效果
+- Bootstrap 与时间条件一致，价值估计更可信；Rollout 显存显著下降；eval 与训练行为一致。
+- α 随策略熵相对目标自动调节，减少手工盯 `entropy_alpha`；日志可看 `train/entropy_alpha`、`loss/alpha`。
