@@ -1,7 +1,5 @@
 # systems/painter.py
-import math
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
 import torchvision.utils as vutils
@@ -75,14 +73,9 @@ class PainterSystem(pl.LightningModule):
 
         self.use_msssim = float(getattr(self.cfg.train, "msssim_lambda", 0.0)) > 0.0
 
-        # ---- SAC 自动温度调整：log α 作为可学习参数 ----
-        alpha_init = float(getattr(self.cfg.train, "entropy_alpha", 1e-3))
-        self.log_alpha = nn.Parameter(
-            torch.tensor(math.log(max(alpha_init, 1e-8)), dtype=torch.float32)
-        )
-        # 目标熵 = -token_dim * coef；coef<1 可减少探索量
-        coef = float(getattr(self.cfg.train, "target_entropy_coef", 1.0))
-        self.target_entropy = -float(self.cfg.model.token_dim) * coef
+        # 熵退火：相似度长期「卡在」plateau_sim 附近后才开始把 α 线性降到 entropy_alpha_end
+        self.register_buffer("_entropy_anneal_start_step", torch.tensor(-1, dtype=torch.long))
+        self.register_buffer("_entropy_plateau_streak", torch.tensor(0, dtype=torch.long))
 
     # ---------------- helpers ----------------
     def _soft_update(self):
@@ -91,6 +84,47 @@ class PainterSystem(pl.LightningModule):
         target_nets.soft_update(self.critic1_t, self.critic1, tau)
         target_nets.soft_update(self.critic2_t, self.critic2, tau)
         target_nets.soft_update(self.D_t, self.D, tau)
+
+    def _current_entropy_alpha(self) -> float:
+        """SAC 熵系数；未触发退火前为 entropy_alpha，触发后线性退火至 entropy_alpha_end。"""
+        T = self.cfg.train
+        a0 = float(getattr(T, "entropy_alpha", 1e-5))
+        a1 = float(getattr(T, "entropy_alpha_end", 0.0))
+        duration = max(int(getattr(T, "entropy_anneal_duration", 50_000)), 1)
+        start = int(self._entropy_anneal_start_step.item())
+        if start < 0:
+            return a0
+        gs = int(self.global_step)
+        if gs <= start:
+            return a0
+        t = min(1.0, float(gs - start) / float(duration))
+        return (1.0 - t) * a0 + t * a1
+
+    def _update_entropy_anneal_after_rollout(self, rollout_sim_mean: float) -> None:
+        """rollout 结束画布相对目标的 batch 平均相似度；在 warmup 之后统计「卡在 plateau」以触发退火。"""
+        T = self.cfg.train
+        a0 = float(getattr(T, "entropy_alpha", 1e-5))
+        a1 = float(getattr(T, "entropy_alpha_end", 0.0))
+        if abs(a0 - a1) < 1e-12:
+            return
+        if self.global_step < int(T.warmup_steps):
+            return
+        if int(self._entropy_anneal_start_step.item()) >= 0:
+            return
+
+        center = float(getattr(T, "entropy_plateau_sim", 0.95))
+        band = float(getattr(T, "entropy_plateau_band", 0.02))
+        patience = int(getattr(T, "entropy_plateau_patience", 500))
+        low, high = center - band, center + band
+
+        if low <= rollout_sim_mean <= high:
+            self._entropy_plateau_streak.add_(1)
+        else:
+            self._entropy_plateau_streak.zero_()
+
+        if int(self._entropy_plateau_streak.item()) >= patience:
+            self._entropy_anneal_start_step.fill_(int(self.global_step))
+            self.log("train/entropy_anneal_start_step", float(self.global_step), prog_bar=False)
 
     def _renderer_consistency_loss(
         self,
@@ -201,21 +235,16 @@ class PainterSystem(pl.LightningModule):
             weight_decay=wd
         )
         
-        # 3. Discriminator
+        # 3. Discriminator (判别器通常不需要太大的权重衰减，甚至可以保持 Adam)
+        # 但为了风格统一，用 AdamW 并把 wd 设小一点或设为 0 也行
         opt_D = torch.optim.AdamW(
-            self.D.parameters(),
-            lr=float(train.d_lr),
+            self.D.parameters(), 
+            lr=float(train.d_lr), 
             betas=(0.5, 0.999),
-            weight_decay=0.0,
+            weight_decay=0.0  # 判别器通常不建议设太强衰减
         )
-
-        # 4. SAC 温度系数 log α（标量，Adam 即可）
-        opt_alpha = torch.optim.Adam(
-            [self.log_alpha],
-            lr=float(getattr(train, "alpha_lr", 3e-4)),
-        )
-
-        return [opt_arc, opt_critics, opt_D, opt_alpha]
+        
+        return [opt_arc, opt_critics, opt_D]
 
     def _compute_reward(self, I, C_curr, C_next, is_terminal):
         """
@@ -328,7 +357,12 @@ class PainterSystem(pl.LightningModule):
     
     # ---------------- rollout ----------------
     def _run_rollout(self, batch, batch_idx: int) -> None:
-        """收集一 batch 的 rollout 数据并写入 buffer，必要时打 log。"""
+        """收集一 batch 的 rollout 数据并写入 buffer，必要时打 log。
+
+        勿对主循环整体包 ``torch.no_grad()``：在 Lightning ``precision=16`` + DDP 下曾出现 rollout
+        可视化长期纯灰；transition 写入前已在 ``ReplayBuffer.add`` 内 ``detach().cpu()``，不会把本段
+        图接到后续 ``manual_backward``。若需省显存，应改小 batch/horizon 或换 precision，而不是在此处关梯度。
+        """
         T = self.cfg.train
         M = self.cfg.model
         I_star = batch["img"].to(self.device)
@@ -342,32 +376,36 @@ class PainterSystem(pl.LightningModule):
         do_dump = (batch_idx % dump_every == 0)
         debug_frames = []
 
+        for t in range(horizon):
+            t_norm = float(t) / max(float(horizon - 1), 1.0)
+            t_emb = torch.full((B, 1), t_norm, device=self.device)
+
+            if self.global_step < warmup:
+                a = torch.randn(B, M.token_dim, device=self.device).tanh()
+            else:
+                a_sample, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
+                a = a_sample.detach()
+
+            _, z, _, _, _ = self.vq(a)
+            C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
+
+            sim_vec = self.sim_fn(C_next, I_star).view(B, -1).mean(dim=1)
+            done_bool = (sim_vec >= stop_tau)
+            done_float = done_bool.float().unsqueeze(1)
+
+            self.buf.add(I_star, C_live, a, C_next, done=done_float, t=t_emb)
+            C_live = C_next.detach()
+
+            if do_dump and (t % 10 == 0):
+                debug_frames.append(C_live[0].detach().cpu())
+
+            if done_bool.all():
+                break
+
+        # 熵退火统计用标量，不需要建图
         with torch.no_grad():
-            for t in range(horizon):
-                t_norm = float(t) / max(float(horizon - 1), 1.0)
-                t_emb = torch.full((B, 1), t_norm, device=self.device)
-
-                if self.global_step < warmup:
-                    a = torch.randn(B, M.token_dim, device=self.device).tanh()
-                else:
-                    a, _, _, _ = self.actor.sample(I_star, C_live, t_emb=t_emb)
-
-                _, z, _, _, _ = self.vq(a)
-                C_next = self.renderer(C_live, z, t_emb=t_emb).clamp(-1, 1)
-
-                sim_vec = self.sim_fn(C_next, I_star).view(B, -1).mean(dim=1)
-                done_bool = (sim_vec >= stop_tau)
-                done_float = done_bool.float().unsqueeze(1)
-
-                self.buf.add(I_star, C_live, a, C_next, done=done_float, t=t_emb)
-                C_live = C_next.detach()
-
-                if do_dump and (t % 10 == 0):
-                    debug_frames.append(C_live[0].detach().cpu())
-
-                if done_bool.all():
-                    break
-
+            rollout_sim_mean = float(self.sim_fn(C_live, I_star).mean().item())
+        self._update_entropy_anneal_after_rollout(rollout_sim_mean)
 
         if do_dump and len(debug_frames) > 0:
             debug_frames.append(I_star[0].detach().cpu())
@@ -385,7 +423,7 @@ class PainterSystem(pl.LightningModule):
         """用 buffer 中 terminal 样本训练判别器若干步。"""
         T = self.cfg.train
         M = self.cfg.model
-        opt_arc, opt_critics, opt_D, opt_alpha = self.optimizers()
+        opt_arc, opt_critics, opt_D = self.optimizers()
         d_steps = int(T.d_steps)
         d_batch = int(T.d_batch)
 
@@ -411,18 +449,17 @@ class PainterSystem(pl.LightningModule):
     def _step_critic(self) -> None:
         """从 buffer 采样，算 reward 与 target Q，更新双 Q。"""
         T = self.cfg.train
-        opt_arc, opt_critics, opt_D, opt_alpha = self.optimizers()
+        opt_arc, opt_critics, opt_D = self.optimizers()
         batch_rl = int(T.batch_rl)
         gamma = float(T.gamma)
+        horizon = int(getattr(T, "horizon", 1))
 
         if not self.buf.ready(batch_rl):
             return
         I_s, C_s, a_s, C_ns, done_s, t_s = self.buf.sample(batch_rl, self.device)
         is_terminal = (done_s > 0.5) | (t_s > 0.95)
-
-        # next-state 的 t_emb 应比当前步多一个步长
-        t_step = 1.0 / max(float(int(T.horizon) - 1), 1.0)
-        t_s_next = (t_s + t_step).clamp(0.0, 1.0)
+        dt = 1.0 / max(float(horizon - 1), 1.0)
+        t_s_next = (t_s + dt).clamp(0.0, 1.0)
 
         self.toggle_optimizer(opt_critics)
         opt_critics.zero_grad(set_to_none=True)
@@ -449,18 +486,17 @@ class PainterSystem(pl.LightningModule):
         """SAC：从 buffer 采样，重参数动作与 log π，最大化 r + γQ - α log π，更新 Actor/Renderer 并软更新 target。"""
         T = self.cfg.train
         M = self.cfg.model
-        opt_arc, opt_critics, opt_D, opt_alpha = self.optimizers()
+        opt_arc, opt_critics, opt_D = self.optimizers()
         batch_rl = int(T.batch_rl)
         gamma = float(T.gamma)
+        horizon = int(getattr(T, "horizon", 1))
 
         if not self.buf.ready(batch_rl):
             return
         I_s, C_s, a_s, _, done_s, t_s = self.buf.sample(batch_rl, self.device)
         is_terminal = (done_s > 0.5) | (t_s > 0.95)
-
-        # next-state 的 t_emb 应比当前步多一个步长
-        t_step = 1.0 / max(float(int(T.horizon) - 1), 1.0)
-        t_s_next = (t_s + t_step).clamp(0.0, 1.0)
+        dt = 1.0 / max(float(horizon - 1), 1.0)
+        t_s_next = (t_s + dt).clamp(0.0, 1.0)
 
         self.toggle_optimizer(opt_arc)
         opt_arc.zero_grad(set_to_none=True)
@@ -478,9 +514,9 @@ class PainterSystem(pl.LightningModule):
         v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s_next)
         min_v_next = torch.minimum(v1_next, v2_next)
         q_val = (1.0 - done_s.squeeze(1)) * min_v_next
-        alpha = self.log_alpha.exp()
-        actor_obj = r_b_total + gamma * q_val - alpha.detach() * logp_hat
-        renderer_consistency_lambda = float(getattr(T, "renderer_consistency_lambda", 0.0))
+        entropy_alpha = self._current_entropy_alpha()
+        actor_obj = r_b_total + gamma * q_val - entropy_alpha * logp_hat
+        renderer_consistency_lambda = float(getattr(T, "renderer_consistency_lambda", 0.05))
         if renderer_consistency_lambda > 0.0:
             loss_consistency = self._renderer_consistency_loss(C_s, z_hat, t_s, C_next_hat)
         else:
@@ -498,18 +534,8 @@ class PainterSystem(pl.LightningModule):
         self.untoggle_optimizer(opt_arc)
         self._soft_update()
 
-        # ---- 自动温度调整：更新 log α ----
-        self.toggle_optimizer(opt_alpha)
-        opt_alpha.zero_grad(set_to_none=True)
-        # 目标：E[logπ] ≈ target_entropy；logp 越高（策略越确定）→ α 越大以推向更高熵
-        alpha_loss = -(self.log_alpha * (logp_hat.detach() + self.target_entropy)).mean()
-        self.manual_backward(alpha_loss)
-        opt_alpha.step()
-        self.untoggle_optimizer(opt_alpha)
-
         self.log("loss/actor", loss_actor.detach(), prog_bar=True)
-        self.log("train/entropy_alpha", alpha.item(), prog_bar=False)
-        self.log("loss/alpha", alpha_loss.detach(), prog_bar=False)
+        self.log("train/entropy_alpha", entropy_alpha, prog_bar=False)
         self.log("loss/renderer_consistency", loss_consistency.detach(), prog_bar=False)
         mask_idx = r_info_b["mask_idx"]
         if mask_idx.any():
