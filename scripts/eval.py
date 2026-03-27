@@ -20,6 +20,7 @@ def rollout(sys, batch, max_steps=1024, stop_tau=0.98, outdir="outputs"):
         t_emb = torch.full((B, 1), t_norm, device=device)
         a = sys.actor.act_deterministic(I_star, C_cur, t_emb=t_emb)
         _, z, _, _, _ = sys.vq(a)
+        # renderer 已返回 C_next（内部是 C + delta）
         C_next = sys.renderer(C_cur, z, t_emb=t_emb).clamp(-1, 1)
 
         # 保存当前步的画布（[-1,1] → [0,1]）
