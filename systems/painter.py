@@ -105,6 +105,7 @@ class PainterSystem(pl.LightningModule):
         T = self.cfg.train
         a0 = float(getattr(T, "entropy_alpha", 1e-5))
         a1 = float(getattr(T, "entropy_alpha_end", 0.0))
+        # If annealing is effectively disabled, don't mutate the anneal state at all.
         if abs(a0 - a1) < 1e-12:
             return
         if self.global_step < int(T.warmup_steps):
@@ -465,6 +466,7 @@ class PainterSystem(pl.LightningModule):
         opt_critics.zero_grad(set_to_none=True)
         with torch.no_grad():
             r_total, r_info = self._compute_reward(I_s, C_s, C_ns, is_terminal)
+            # next-state value should be conditioned on t_{s+1}
             v1_t = self.critic1_t(I_s, C_ns, t_emb=t_s_next)
             v2_t = self.critic2_t(I_s, C_ns, t_emb=t_s_next)
             min_v = torch.minimum(v1_t, v2_t)
@@ -510,6 +512,7 @@ class PainterSystem(pl.LightningModule):
 
         self.log("train/sim_actor", r_info_b["sim_score"].mean(), prog_bar=False)
 
+        # value of next canvas should be conditioned on t_{s+1}
         v1_next = self.critic1_t(I_s, C_next_hat, t_emb=t_s_next)
         v2_next = self.critic2_t(I_s, C_next_hat, t_emb=t_s_next)
         min_v_next = torch.minimum(v1_next, v2_next)
